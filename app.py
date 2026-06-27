@@ -623,8 +623,22 @@ def main():
         st.subheader("📚 Historial de relaciones guardadas")
         historial_actual = cargar_historial()
         if historial_actual:
+            col_hist1, col_hist2 = st.columns([2, 1])
+            with col_hist2:
+                if st.button("🗑️ Limpiar todo el historial", type="secondary"):
+                    guardar_historial({})
+                    st.success("Historial limpiado.")
+                    st.rerun()
+
             for curso, relaciones in historial_actual.items():
                 with st.expander(f"Curso: {curso[:60]}"):
+                    col_c1, col_c2 = st.columns([3, 1])
+                    with col_c2:
+                        if st.button(f"🗑️ Limpiar este curso", key=f"del_{curso[:20]}"):
+                            del historial_actual[curso]
+                            guardar_historial(historial_actual)
+                            st.success("Curso eliminado del historial.")
+                            st.rerun()
                     filas = []
                     for clave, codigo in relaciones.items():
                         if codigo == '__IGNORAR__':
