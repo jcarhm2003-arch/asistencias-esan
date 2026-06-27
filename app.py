@@ -198,7 +198,7 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
                     'alumno': alumno_nombre,
                     'metodo': '💾 Historial'
                 })
-                continue
+            continue  # ya está en historial, no mostrar en pendientes aunque el código no esté
 
         # Nivel 3: match por palabras (>= 2 coincidencias)
         mejor_score = 0
@@ -415,9 +415,12 @@ def main():
                 st.subheader(f"⚠️ Pendientes de revisión manual ({len(pendientes)})")
                 st.caption("Estos nombres no coincidieron automáticamente. Enlázalos o ignóralos.")
 
+                # Solo mostrar alumnos que aún no tienen asistencia marcada
+                codigos_con_a = {cod for cod, val in resultado.items() if val == 'A'}
                 opciones_alumnos = ["— No enlazar / Ignorar"] + [
                     f"{row['Nombre']} ({row['Codigo']})"
                     for _, row in df_alumnos.iterrows()
+                    if row['Codigo'] not in codigos_con_a
                 ]
 
                 relaciones_manuales = {}
