@@ -566,7 +566,7 @@ def main():
 
             cols_sesion = [c for c in df_resultado.columns if c.startswith('S')]
             st.dataframe(
-                df_resultado.style.applymap(colorear, subset=cols_sesion),
+                df_resultado.style.map(colorear, subset=cols_sesion),
                 use_container_width=True,
                 hide_index=True,
                 height=500
