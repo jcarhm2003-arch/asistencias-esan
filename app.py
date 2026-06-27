@@ -28,10 +28,10 @@ def normalizar(texto):
     if not texto:
         return ""
     texto = str(texto)
-    texto = re.sub(r'\(.*?\)', '', texto)       # quitar alias entre paréntesis
-    texto = unidecode(texto)                    # quitar tildes
+    texto = re.sub(r'\(.*?\)', '', texto)
+    texto = unidecode(texto)
     texto = texto.lower()
-    texto = re.sub(r'[^a-z\s]', '', texto)     # quitar puntos y símbolos
+    texto = re.sub(r'[^a-z\s]', '', texto)
     return texto.strip()
 
 def palabras(texto):
@@ -114,18 +114,14 @@ def leer_csv_zoom(archivo):
         st.error(f"No se encontró la columna '{col_nombre}' en el CSV.")
         return None
 
-    # Participantes únicos por nombre+correo (pueden repetirse por entrar/salir)
     df = df[[col_nombre, col_correo]].copy()
     df.columns = ['nombre_zoom', 'correo']
     df['nombre_zoom'] = df['nombre_zoom'].astype(str).str.strip()
     df['correo'] = df['correo'].astype(str).str.strip().replace('nan', '')
 
-    # Quitar filas vacías o con nombres de sala
     df = df[df['nombre_zoom'].str.len() > 1]
     df = df[~df['nombre_zoom'].str.lower().str.contains('sala online|sala esan', na=False)]
 
-    # Deduplicar — si un participante entró/salió varias veces, quedarse con 1 fila
-    # Preferir la fila que tiene correo
     df['tiene_correo'] = df['correo'].str.contains('@esan', na=False)
     df = df.sort_values('tiene_correo', ascending=False)
     df = df.drop_duplicates(subset='nombre_zoom', keep='first')
@@ -156,12 +152,6 @@ def clave_historial(nombre_zoom):
 # ─────────────────────────────────────────────
 
 def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
-    """
-    Retorna:
-      - resultado: dict {codigo_alumno: 'A' | 'F' | 'P'}
-      - pendientes: lista de dicts con nombre_zoom sin match automático
-      - auto_matches: lista de dicts con matches automáticos para mostrar
-    """
     resultado = {row['Codigo']: 'F' for _, row in df_alumnos.iterrows()}
     pendientes = []
     auto_matches = []
@@ -189,7 +179,7 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
         if clave in historial_curso:
             codigo_guardado = historial_curso[clave]
             if codigo_guardado == '__IGNORAR__':
-                continue  # nombre ignorado (ej: profesor, sala)
+                continue
             if codigo_guardado in resultado:
                 resultado[codigo_guardado] = 'A'
                 alumno_nombre = df_alumnos[df_alumnos['Codigo'] == codigo_guardado]['Nombre'].values[0]
@@ -198,7 +188,7 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
                     'alumno': alumno_nombre,
                     'metodo': '💾 Historial'
                 })
-            continue  # ya está en historial, no mostrar en pendientes aunque el código no esté
+            continue
 
         # Nivel 3: match por palabras (>= 2 coincidencias)
         mejor_score = 0
@@ -233,14 +223,9 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
 # ─────────────────────────────────────────────
 
 def exportar_excel(archivo_original, sesiones, metadata):
-    """
-    Genera Excel con columnas S1, S2, S3... añadidas al lado del nombre.
-    sesiones: lista de dicts {label: 'S1', resultado: {codigo: 'A'|'F'}}
-    """
     wb = load_workbook(archivo_original)
     ws = wb.active
 
-    # Encontrar fila header y columna nombre
     header_row_idx = None
     for i, row in enumerate(ws.iter_rows(values_only=True), 1):
         if row[0] == 'No':
@@ -250,17 +235,13 @@ def exportar_excel(archivo_original, sesiones, metadata):
     if not header_row_idx:
         return None
 
-    # Columna donde escribir S1, S2... (después de Apellidos y Nombres = col C=3, combinada hasta F=6)
-    # Usamos columna 7 en adelante para las sesiones
     col_inicio_sesiones = 7
 
-    # Colores
     verde = PatternFill("solid", fgColor="C6EFCE")
     rojo = PatternFill("solid", fgColor="FFC7CE")
     amarillo = PatternFill("solid", fgColor="FFEB9C")
     azul_header = PatternFill("solid", fgColor="BDD7EE")
 
-    # Escribir encabezados de sesiones
     for s_idx, sesion in enumerate(sesiones):
         col = col_inicio_sesiones + s_idx
         cell = ws.cell(row=header_row_idx, column=col, value=sesion['label'])
@@ -268,7 +249,6 @@ def exportar_excel(archivo_original, sesiones, metadata):
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal='center')
 
-    # Escribir resultados por alumno
     for row_idx in range(header_row_idx + 1, ws.max_row + 1):
         codigo_cell = ws.cell(row=row_idx, column=2)
         if not codigo_cell.value:
@@ -322,7 +302,6 @@ def main():
                 st.markdown(f"**Curso:** {metadata.get('curso', '—')}")
                 st.markdown(f"**Profesor:** {metadata.get('profesor', '—')}")
 
-                # ID único del curso para historial
                 curso_id = metadata.get('curso', 'sin_curso')
                 st.session_state['metadata'] = metadata
                 st.session_state['df_alumnos'] = df_alumnos
@@ -391,64 +370,101 @@ def main():
                     st.session_state['label_sesion'] = label_sesion
                     st.rerun()
 
-        # ── MATCHES AUTOMÁTICOS ──
+        # ── REVISIÓN: TODOS LOS PARTICIPANTES ZOOM ──
         if 'auto_matches_actuales' in st.session_state:
             auto_matches = st.session_state['auto_matches_actuales']
             pendientes = st.session_state['pendientes_actuales']
             resultado = st.session_state['resultado_actual']
 
+            # Métricas
             col_a, col_b, col_c = st.columns(3)
             total_asistio = sum(1 for v in resultado.values() if v == 'A')
             col_a.metric("✅ Asistieron (auto)", total_asistio)
             col_b.metric("⚠️ Pendientes", len(pendientes))
-            col_c.metric("❌ Faltas", len(df_alumnos) - total_asistio - len(pendientes))
+            col_c.metric("❌ Faltas", len(df_alumnos) - total_asistio)
 
-            if auto_matches:
-                with st.expander(f"✅ Matches automáticos ({len(auto_matches)})", expanded=False):
-                    df_auto = pd.DataFrame(auto_matches)
-                    df_auto.columns = ['Nombre en Zoom', 'Alumno en lista', 'Método']
-                    st.dataframe(df_auto, use_container_width=True, hide_index=True)
+            st.markdown("---")
+            st.subheader("👥 Revisión de participantes Zoom")
+            st.caption("Los enlazados automáticamente aparecen con ✅ (no editables). Los pendientes tienen selector con la lista completa de alumnos.")
 
-            # ── PENDIENTES: REVISIÓN MANUAL ──
-            if pendientes:
-                st.markdown("---")
-                st.subheader(f"⚠️ Pendientes de revisión manual ({len(pendientes)})")
-                st.caption("Estos nombres no coincidieron automáticamente. Enlázalos o ignóralos.")
+            # Códigos ya con asistencia confirmada
+            codigos_con_a = {cod for cod, val in resultado.items() if val == 'A'}
 
-                # Solo mostrar alumnos que aún no tienen asistencia marcada
-                codigos_con_a = {cod for cod, val in resultado.items() if val == 'A'}
-                opciones_alumnos = ["— No enlazar / Ignorar"] + [
-                    f"{row['Nombre']} ({row['Codigo']})"
-                    for _, row in df_alumnos.iterrows()
-                    if row['Codigo'] not in codigos_con_a
-                ]
+            # Lista de opciones para selectbox con estado de cada alumno
+            opciones_alumnos = ["— No enlazar / Ignorar"] + [
+                f"{'✅ ' if row['Codigo'] in codigos_con_a else '❌ F  '}{row['Nombre']} ({row['Codigo']})"
+                for _, row in df_alumnos.iterrows()
+            ]
 
-                relaciones_manuales = {}
+            relaciones_manuales = {}
 
-                for i, pax in enumerate(pendientes):
-                    nombre_zoom = pax['nombre_zoom']
-                    sugerencia = pax['mejor_sugerencia']
+            # Reunir todos: primero auto-matches, luego pendientes
+            todos_zoom = []
+            for m in auto_matches:
+                todos_zoom.append({
+                    'nombre_zoom': m['nombre_zoom'],
+                    'correo': '',
+                    'mejor_sugerencia': m['alumno'],
+                    'metodo': m['metodo'],
+                    'es_auto': True
+                })
+            for pax in pendientes:
+                todos_zoom.append({
+                    'nombre_zoom': pax['nombre_zoom'],
+                    'correo': pax['correo'],
+                    'mejor_sugerencia': pax['mejor_sugerencia'],
+                    'metodo': None,
+                    'es_auto': False
+                })
 
-                    with st.container():
-                        col_zoom, col_flecha, col_select = st.columns([3, 0.5, 4])
+            for i, pax in enumerate(todos_zoom):
+                nombre_zoom = pax['nombre_zoom']
+                es_auto = pax['es_auto']
 
-                        with col_zoom:
+                with st.container():
+                    col_zoom, col_flecha, col_select = st.columns([3, 0.5, 4])
+
+                    with col_zoom:
+                        if es_auto:
+                            color_borde = "#28a745"
+                            color_bg = "#d4edda"
+                            metodo_badge = f"<small style='color:#155724'>{pax['metodo']}</small>"
+                        else:
+                            color_borde = "#ffc107"
+                            color_bg = "#fff3cd"
+                            correo_display = pax['correo'] if pax['correo'] and pax['correo'] != 'nan' else '—'
+                            metodo_badge = f"<small style='color:#856404'>⚠️ Sin enlazar &nbsp;|&nbsp; Correo: {correo_display}</small>"
+
+                        st.markdown(
+                            f"<div style='background:{color_bg};padding:10px;border-radius:8px;"
+                            f"border-left:4px solid {color_borde};margin:4px 0;color:#1a1a1a'>"
+                            f"<b style='color:#1a1a1a'>Zoom:</b> {nombre_zoom}<br>"
+                            f"{metodo_badge}"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+
+                    with col_flecha:
+                        st.markdown(
+                            "<div style='padding-top:18px;text-align:center;font-size:20px'>→</div>",
+                            unsafe_allow_html=True
+                        )
+
+                    with col_select:
+                        if es_auto:
+                            # No editable — mostrar alumno enlazado
+                            alumno_enlazado = pax['mejor_sugerencia']
                             st.markdown(
-                                f"<div style='background:#fff3cd;padding:10px;border-radius:8px;"
-                                f"border-left:4px solid #ffc107;margin:4px 0;color:#1a1a1a'>"
-                                f"<b style='color:#1a1a1a'>Zoom:</b> {nombre_zoom}<br>"
-                                f"<small style='color:#555'>Correo: {pax['correo'] or '—'}</small>"
+                                f"<div style='background:#d4edda;padding:10px;border-radius:8px;"
+                                f"border:1px solid #c3e6cb;margin:4px 0;color:#155724;font-weight:bold'>"
+                                f"✅ {alumno_enlazado}"
                                 f"</div>",
                                 unsafe_allow_html=True
                             )
-
-                        with col_flecha:
-                            st.markdown("<div style='padding-top:18px;text-align:center;font-size:20px'>→</div>",
-                                        unsafe_allow_html=True)
-
-                        with col_select:
-                            # Pre-seleccionar sugerencia si existe
+                        else:
+                            # Selectbox editable con lista completa de alumnos
                             idx_default = 0
+                            sugerencia = pax['mejor_sugerencia']
                             if sugerencia:
                                 for j, op in enumerate(opciones_alumnos):
                                     if sugerencia in op:
@@ -456,7 +472,7 @@ def main():
                                         break
 
                             seleccion = st.selectbox(
-                                f"Alumno para: {nombre_zoom[:30]}...",
+                                f"Alumno para: {nombre_zoom[:30]}",
                                 opciones_alumnos,
                                 index=idx_default,
                                 key=f"select_{i}",
@@ -464,67 +480,54 @@ def main():
                             )
                             relaciones_manuales[nombre_zoom] = seleccion
 
-                        st.markdown("<hr style='margin:4px 0;opacity:0.2'>", unsafe_allow_html=True)
+                    st.markdown("<hr style='margin:4px 0;opacity:0.2'>", unsafe_allow_html=True)
 
-                col_rep, col_ok = st.columns([1, 1])
+            # ── BOTONES ──
+            st.markdown("---")
+            col_rep, col_ok = st.columns([1, 1])
 
-                with col_rep:
-                    if st.button("🔄 Reprocesar con estas relaciones", type="secondary"):
-                        # Aplicar relaciones al resultado
-                        for nombre_zoom, seleccion in relaciones_manuales.items():
-                            if seleccion == "— No enlazar / Ignorar":
-                                clave = clave_historial(nombre_zoom)
-                                if curso_id not in historial:
-                                    historial[curso_id] = {}
-                                historial[curso_id][clave] = '__IGNORAR__'
-                            else:
-                                match = re.search(r'\((\d+)\)$', seleccion)
-                                if match:
-                                    codigo = match.group(1)
-                                    resultado[codigo] = 'A'
-                                    clave = clave_historial(nombre_zoom)
-                                    if curso_id not in historial:
-                                        historial[curso_id] = {}
-                                    historial[curso_id][clave] = codigo
-
-                        guardar_historial(historial)
-                        st.session_state['resultado_actual'] = resultado
-                        st.session_state['pendientes_actuales'] = []
-                        st.success("✅ Relaciones aplicadas y guardadas en historial.")
-                        st.rerun()
-
-                with col_ok:
-                    if st.button("✅ Confirmar sesión y guardar", type="primary"):
-                        # Guardar relaciones en historial
-                        for nombre_zoom, seleccion in relaciones_manuales.items():
+            with col_rep:
+                if pendientes and st.button("🔄 Reprocesar con estas relaciones", type="secondary"):
+                    for nombre_zoom, seleccion in relaciones_manuales.items():
+                        if seleccion == "— No enlazar / Ignorar":
                             clave = clave_historial(nombre_zoom)
                             if curso_id not in historial:
                                 historial[curso_id] = {}
-                            if seleccion == "— No enlazar / Ignorar":
-                                historial[curso_id][clave] = '__IGNORAR__'
-                            else:
-                                match = re.search(r'\((\d+)\)$', seleccion)
-                                if match:
-                                    codigo = match.group(1)
-                                    resultado[codigo] = 'A'
-                                    historial[curso_id][clave] = codigo
+                            historial[curso_id][clave] = '__IGNORAR__'
+                        else:
+                            match = re.search(r'\((\d+)\)$', seleccion)
+                            if match:
+                                codigo = match.group(1)
+                                resultado[codigo] = 'A'
+                                clave = clave_historial(nombre_zoom)
+                                if curso_id not in historial:
+                                    historial[curso_id] = {}
+                                historial[curso_id][clave] = codigo
 
-                        guardar_historial(historial)
+                    guardar_historial(historial)
+                    st.session_state['resultado_actual'] = resultado
+                    st.session_state['pendientes_actuales'] = []
+                    st.success("✅ Relaciones aplicadas y guardadas en historial.")
+                    st.rerun()
 
-                        # Guardar sesión
-                        st.session_state['sesiones'].append({
-                            'label': st.session_state['label_sesion'],
-                            'resultado': resultado
-                        })
-                        st.session_state.pop('pendientes_actuales', None)
-                        st.session_state.pop('resultado_actual', None)
-                        st.session_state.pop('auto_matches_actuales', None)
-                        st.success(f"✅ Sesión '{st.session_state['label_sesion']}' guardada.")
-                        st.rerun()
-
-            else:
-                # Sin pendientes
+            with col_ok:
                 if st.button("✅ Confirmar sesión y guardar", type="primary"):
+                    # Guardar relaciones manuales en historial
+                    for nombre_zoom, seleccion in relaciones_manuales.items():
+                        clave = clave_historial(nombre_zoom)
+                        if curso_id not in historial:
+                            historial[curso_id] = {}
+                        if seleccion == "— No enlazar / Ignorar":
+                            historial[curso_id][clave] = '__IGNORAR__'
+                        else:
+                            match = re.search(r'\((\d+)\)$', seleccion)
+                            if match:
+                                codigo = match.group(1)
+                                resultado[codigo] = 'A'
+                                historial[curso_id][clave] = codigo
+
+                    guardar_historial(historial)
+
                     st.session_state['sesiones'].append({
                         'label': st.session_state['label_sesion'],
                         'resultado': resultado
@@ -532,7 +535,7 @@ def main():
                     st.session_state.pop('pendientes_actuales', None)
                     st.session_state.pop('resultado_actual', None)
                     st.session_state.pop('auto_matches_actuales', None)
-                    st.success(f"✅ Sesión '{st.session_state['label_sesion']}' guardada sin pendientes.")
+                    st.success(f"✅ Sesión '{st.session_state['label_sesion']}' guardada.")
                     st.rerun()
 
     # ─── TAB 2: RESULTADOS ───
@@ -576,7 +579,6 @@ def main():
                 height=500
             )
 
-            # Resumen
             st.markdown("---")
             col1, col2, col3 = st.columns(3)
             col1.metric("Total alumnos", len(df_alumnos))
