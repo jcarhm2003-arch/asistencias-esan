@@ -432,9 +432,9 @@ def main():
                         with col_zoom:
                             st.markdown(
                                 f"<div style='background:#fff3cd;padding:10px;border-radius:8px;"
-                                f"border-left:4px solid #ffc107;margin:4px 0'>"
-                                f"<b>Zoom:</b> {nombre_zoom}<br>"
-                                f"<small style='color:#666'>Correo: {pax['correo'] or '—'}</small>"
+                                f"border-left:4px solid #ffc107;margin:4px 0;color:#1a1a1a'>"
+                                f"<b style='color:#1a1a1a'>Zoom:</b> {nombre_zoom}<br>"
+                                f"<small style='color:#555'>Correo: {pax['correo'] or '—'}</small>"
                                 f"</div>",
                                 unsafe_allow_html=True
                             )
