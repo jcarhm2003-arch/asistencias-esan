@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import re
 import io
+import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -101,20 +102,33 @@ def leer_excel_asistencia(archivo):
     return metadata, df
 
 def leer_csv_zoom(archivo):
-    """Lee CSV de Zoom y retorna DataFrame con participantes únicos."""
+    """Lee CSV de Zoom y retorna DataFrame con participantes únicos
+    + diccionario de primera hora de entrada por nombre."""
     try:
-        df = pd.read_csv(archivo, sep=';', encoding='utf-8')
+        df_raw = pd.read_csv(archivo, sep=';', encoding='utf-8')
     except Exception:
-        df = pd.read_csv(archivo, sep=';', encoding='latin-1')
+        df_raw = pd.read_csv(archivo, sep=';', encoding='latin-1')
 
     col_nombre = 'Nombre (nombre original)'
     col_correo = 'Correo electrónico'
+    col_hora_entrada = 'Hora de entrada'
 
-    if col_nombre not in df.columns:
+    if col_nombre not in df_raw.columns:
         st.error(f"No se encontró la columna '{col_nombre}' en el CSV.")
-        return None
+        return None, None
 
-    df = df[[col_nombre, col_correo]].copy()
+    # Calcular primera hora de entrada por nombre (antes de deduplicar)
+    primeras_horas = {}
+    if col_hora_entrada in df_raw.columns:
+        df_horas = df_raw[[col_nombre, col_hora_entrada]].copy()
+        df_horas.columns = ['nombre_zoom', 'hora_entrada']
+        df_horas['nombre_zoom'] = df_horas['nombre_zoom'].astype(str).str.strip()
+        df_horas['hora_entrada'] = pd.to_datetime(
+            df_horas['hora_entrada'], format='%d/%m/%Y %H:%M', errors='coerce'
+        )
+        primeras_horas = df_horas.groupby('nombre_zoom')['hora_entrada'].min().to_dict()
+
+    df = df_raw[[col_nombre, col_correo]].copy()
     df.columns = ['nombre_zoom', 'correo']
     df['nombre_zoom'] = df['nombre_zoom'].astype(str).str.strip()
     df['correo'] = df['correo'].astype(str).str.strip().replace('nan', '')
@@ -127,7 +141,7 @@ def leer_csv_zoom(archivo):
     df = df.drop_duplicates(subset='nombre_zoom', keep='first')
     df = df.drop(columns='tiene_correo').reset_index(drop=True)
 
-    return df
+    return df, primeras_horas
 
 # ─────────────────────────────────────────────
 # HISTORIAL
@@ -151,27 +165,44 @@ def clave_historial(nombre_zoom):
 # LÓGICA DE CRUCE
 # ─────────────────────────────────────────────
 
-def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
+def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id, primeras_horas=None, hora_limite=None):
+    """
+    resultado: dict {codigo: 'A' | 'T' | 'F'}
+    Si hora_limite está definida (objeto time), compara la primera hora de
+    entrada de cada participante contra ese límite para marcar T (tardanza).
+    """
     resultado = {row['Codigo']: 'F' for _, row in df_alumnos.iterrows()}
     pendientes = []
     auto_matches = []
 
     historial_curso = historial.get(curso_id, {})
 
+    def calcular_estado(nombre_zoom):
+        """Retorna 'A' o 'T' según la hora de entrada, si aplica."""
+        if not hora_limite or not primeras_horas:
+            return 'A'
+        hora_entrada = primeras_horas.get(nombre_zoom)
+        if hora_entrada is None or pd.isna(hora_entrada):
+            return 'A'
+        if hora_entrada.time() > hora_limite:
+            return 'T'
+        return 'A'
+
     for _, pax in df_zoom.iterrows():
         nombre_zoom = pax['nombre_zoom']
         correo = pax['correo']
         codigo_correo = extraer_codigo_correo(correo)
         clave = clave_historial(nombre_zoom)
+        estado = calcular_estado(nombre_zoom)
 
         # Nivel 1: match por código en correo
         if codigo_correo and codigo_correo in resultado:
-            resultado[codigo_correo] = 'A'
+            resultado[codigo_correo] = estado
             alumno_nombre = df_alumnos[df_alumnos['Codigo'] == codigo_correo]['Nombre'].values[0]
             auto_matches.append({
                 'nombre_zoom': nombre_zoom,
                 'alumno': alumno_nombre,
-                'metodo': '📧 Correo'
+                'metodo': '📧 Correo' + (' ⏰' if estado == 'T' else '')
             })
             continue
 
@@ -181,20 +212,20 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
             if codigo_guardado == '__IGNORAR__':
                 continue
             if codigo_guardado in resultado:
-                resultado[codigo_guardado] = 'A'
+                resultado[codigo_guardado] = estado
                 alumno_nombre = df_alumnos[df_alumnos['Codigo'] == codigo_guardado]['Nombre'].values[0]
                 auto_matches.append({
                     'nombre_zoom': nombre_zoom,
                     'alumno': alumno_nombre,
-                    'metodo': '💾 Historial'
+                    'metodo': '💾 Historial' + (' ⏰' if estado == 'T' else '')
                 })
             continue
 
-        # Nivel 3: match por palabras (>= 2 coincidencias)# Nivel 3: match por palabras (>= 2 coincidencias, sin empates)
+        # Nivel 3: match por palabras (>= 2 coincidencias, sin empates)
         mejor_score = 0
         mejor_codigo = None
         mejor_nombre = None
-        empatados = []  # nombres de alumnos que comparten el puntaje máximo
+        empatados = []
         for _, alumno in df_alumnos.iterrows():
             score = coincidencias(nombre_zoom, alumno['Nombre'])
             if score > mejor_score:
@@ -206,25 +237,27 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
                 empatados.append(alumno['Nombre'])
 
         if mejor_score >= 2 and len(empatados) == 1:
-            resultado[mejor_codigo] = 'A'
+            resultado[mejor_codigo] = estado
             auto_matches.append({
                 'nombre_zoom': nombre_zoom,
                 'alumno': mejor_nombre,
-                'metodo': f'🔤 Palabras ({mejor_score})'
+                'metodo': f'🔤 Palabras ({mejor_score})' + (' ⏰' if estado == 'T' else '')
             })
         elif mejor_score >= 2 and len(empatados) > 1:
             pendientes.append({
                 'nombre_zoom': nombre_zoom,
                 'correo': correo,
                 'mejor_sugerencia': None,
-                'mejor_score': mejor_score
+                'mejor_score': mejor_score,
+                'estado': estado
             })
         else:
             pendientes.append({
                 'nombre_zoom': nombre_zoom,
                 'correo': correo,
                 'mejor_sugerencia': mejor_nombre,
-                'mejor_score': mejor_score
+                'mejor_score': mejor_score,
+                'estado': estado
             })
 
     return resultado, pendientes, auto_matches
@@ -274,6 +307,9 @@ def exportar_excel(archivo_original, sesiones, metadata):
             if valor == 'A':
                 cell.fill = verde
                 cell.font = Font(color="276221", bold=True)
+            elif valor == 'T':
+                cell.fill = amarillo
+                cell.font = Font(color="7a5c00", bold=True)
             elif valor == 'F':
                 cell.fill = rojo
                 cell.font = Font(color="9C0006", bold=True)
@@ -354,6 +390,16 @@ def main():
     with tab1:
         st.subheader("Cargar CSV de Zoom")
 
+        usar_hora_limite = st.checkbox("⏰ ¿Aplicar hora límite de tardanza?", key="check_hora_limite")
+        hora_limite_valor = None
+        if usar_hora_limite:
+            hora_limite_input = st.time_input(
+                "Hora límite (después de esta hora se marca Tardanza)",
+                value=datetime.time(18, 10),
+                key="hora_limite_input"
+            )
+            hora_limite_valor = hora_limite_input
+
         col1, col2 = st.columns([2, 1])
         with col1:
             archivo_csv = st.file_uploader(
@@ -369,11 +415,13 @@ def main():
             )
 
         if archivo_csv and label_sesion:
-            df_zoom = leer_csv_zoom(archivo_csv)
+            df_zoom, primeras_horas = leer_csv_zoom(archivo_csv)
             if df_zoom is not None:
                 if st.button("🔄 Procesar sesión", type="primary"):
                     resultado, pendientes, auto_matches = cruzar_asistencia(
-                        df_alumnos, df_zoom, historial, curso_id
+                        df_alumnos, df_zoom, historial, curso_id,
+                        primeras_horas=primeras_horas,
+                        hora_limite=hora_limite_valor
                     )
                     st.session_state['pendientes_actuales'] = pendientes
                     st.session_state['resultado_actual'] = resultado
@@ -388,18 +436,20 @@ def main():
             resultado = st.session_state['resultado_actual']
 
             # Métricas
-            col_a, col_b, col_c = st.columns(3)
+            col_a, col_b, col_c, col_d = st.columns(4)
             total_asistio = sum(1 for v in resultado.values() if v == 'A')
-            col_a.metric("✅ Asistieron (auto)", total_asistio)
-            col_b.metric("⚠️ Pendientes", len(pendientes))
-            col_c.metric("❌ Faltas", len(df_alumnos) - total_asistio)
+            total_tarde = sum(1 for v in resultado.values() if v == 'T')
+            col_a.metric("✅ Asistieron a tiempo", total_asistio)
+            col_b.metric("⏰ Tardanzas", total_tarde)
+            col_c.metric("⚠️ Pendientes", len(pendientes))
+            col_d.metric("❌ Faltas", len(df_alumnos) - total_asistio - total_tarde)
 
             st.markdown("---")
             st.subheader("👥 Revisión de participantes Zoom")
             st.caption("Los enlazados automáticamente aparecen con ✅ (no editables). Los pendientes tienen selector con la lista completa de alumnos.")
 
-            # Códigos ya con asistencia confirmada
-            codigos_con_a = {cod for cod, val in resultado.items() if val == 'A'}
+            # Códigos ya con asistencia confirmada (A o T)
+            codigos_con_a = {cod for cod, val in resultado.items() if val in ('A', 'T')}
 
             # Lista de opciones para selectbox con estado de cada alumno
             opciones_alumnos = ["— No enlazar / Ignorar"] + [
@@ -425,7 +475,8 @@ def main():
                     'correo': pax['correo'],
                     'mejor_sugerencia': pax['mejor_sugerencia'],
                     'metodo': None,
-                    'es_auto': False
+                    'es_auto': False,
+                    'estado': pax.get('estado', 'A')
                 })
 
             for i, pax in enumerate(todos_zoom):
@@ -499,6 +550,8 @@ def main():
 
             with col_rep:
                 if pendientes and st.button("🔄 Reprocesar con estas relaciones", type="secondary"):
+                    estados_pendientes = {p['nombre_zoom']: p.get('estado', 'A') for p in pendientes}
+
                     for nombre_zoom, seleccion in relaciones_manuales.items():
                         if seleccion == "— No enlazar / Ignorar":
                             clave = clave_historial(nombre_zoom)
@@ -509,7 +562,7 @@ def main():
                             match = re.search(r'\((\d+)\)$', seleccion)
                             if match:
                                 codigo = match.group(1)
-                                resultado[codigo] = 'A'
+                                resultado[codigo] = estados_pendientes.get(nombre_zoom, 'A')
                                 clave = clave_historial(nombre_zoom)
                                 if curso_id not in historial:
                                     historial[curso_id] = {}
@@ -523,6 +576,8 @@ def main():
 
             with col_ok:
                 if st.button("✅ Confirmar sesión y guardar", type="primary"):
+                    estados_pendientes = {p['nombre_zoom']: p.get('estado', 'A') for p in pendientes}
+
                     # Guardar relaciones manuales en historial
                     for nombre_zoom, seleccion in relaciones_manuales.items():
                         clave = clave_historial(nombre_zoom)
@@ -534,7 +589,7 @@ def main():
                             match = re.search(r'\((\d+)\)$', seleccion)
                             if match:
                                 codigo = match.group(1)
-                                resultado[codigo] = 'A'
+                                resultado[codigo] = estados_pendientes.get(nombre_zoom, 'A')
                                 historial[curso_id][clave] = codigo
 
                     guardar_historial(historial)
@@ -568,7 +623,7 @@ def main():
                 for i, s in enumerate(sesiones):
                     val = s['resultado'].get(alumno['Codigo'], 'F')
                     fila[f"S{i+1}\n{s['label']}"] = val
-                    if val == 'A':
+                    if val in ('A', 'T'):
                         total_a += 1
                 fila['Total asistencias'] = total_a
                 rows.append(fila)
@@ -578,6 +633,8 @@ def main():
             def colorear(val):
                 if val == 'A':
                     return 'background-color: #C6EFCE; color: #276221; font-weight:bold'
+                elif val == 'T':
+                    return 'background-color: #FFEB9C; color: #7a5c00; font-weight:bold'
                 elif val == 'F':
                     return 'background-color: #FFC7CE; color: #9C0006; font-weight:bold'
                 return ''
@@ -595,7 +652,7 @@ def main():
             col1.metric("Total alumnos", len(df_alumnos))
             col2.metric("Sesiones procesadas", len(sesiones))
             promedio = sum(
-                sum(1 for s in sesiones if s['resultado'].get(a['Codigo']) == 'A')
+                sum(1 for s in sesiones if s['resultado'].get(a['Codigo']) in ('A', 'T'))
                 for _, a in df_alumnos.iterrows()
             ) / max(len(df_alumnos), 1)
             col3.metric("Promedio de asistencia", f"{promedio:.1f} / {len(sesiones)}")
@@ -609,7 +666,7 @@ def main():
             st.subheader("Descargar Excel con asistencias marcadas")
             st.markdown(
                 "El archivo descargado será el Excel original con columnas **S1, S2, S3...** "
-                "añadidas al lado de los nombres, con colores verde (A) y rojo (F)."
+                "añadidas al lado de los nombres, con colores verde (A), amarillo (T) y rojo (F)."
             )
 
             archivo_excel_bytes = st.session_state.get('archivo_excel_bytes')
