@@ -343,7 +343,7 @@ def main():
 
         if archivo_excel:
             excel_bytes = archivo_excel.read()
-            st.session_state['nombre_archivo_original'] = archivo_excel.name
+            metadata, df_alumnos = leer_excel_asistencia(io.BytesIO(excel_bytes))
             if metadata and df_alumnos is not None:
                 st.success(f"✅ {len(df_alumnos)} alumnos cargados")
                 st.markdown(f"**Curso:** {metadata.get('curso', '—')}")
@@ -354,6 +354,7 @@ def main():
                 st.session_state['df_alumnos'] = df_alumnos
                 st.session_state['curso_id'] = curso_id
                 st.session_state['archivo_excel_bytes'] = excel_bytes
+                st.session_state['nombre_archivo_original'] = archivo_excel.name
 
         st.markdown("---")
 
