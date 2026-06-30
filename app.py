@@ -123,9 +123,18 @@ def leer_csv_zoom(archivo):
         df_horas = df_raw[[col_nombre, col_hora_entrada]].copy()
         df_horas.columns = ['nombre_zoom', 'hora_entrada']
         df_horas['nombre_zoom'] = df_horas['nombre_zoom'].astype(str).str.strip()
-        df_horas['hora_entrada'] = pd.to_datetime(
-            df_horas['hora_entrada'], format='%d/%m/%Y %H:%M', errors='coerce'
-        )
+        def parsear_hora(val):
+            try:
+                dt = pd.to_datetime(val, utc=True)
+                return dt.tz_convert('America/Lima').tz_localize(None)
+            except Exception:
+                pass
+            try:
+                return pd.to_datetime(val, format='%d/%m/%Y %H:%M', errors='coerce')
+            except Exception:
+                return pd.NaT
+
+        df_horas['hora_entrada'] = df_horas['hora_entrada'].apply(parsear_hora)
         primeras_horas = df_horas.groupby('nombre_zoom')['hora_entrada'].min().to_dict()
 
     df = df_raw[[col_nombre, col_correo]].copy()
