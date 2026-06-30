@@ -190,23 +190,34 @@ def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id):
                 })
             continue
 
-        # Nivel 3: match por palabras (>= 2 coincidencias)
+        # Nivel 3: match por palabras (>= 2 coincidencias)# Nivel 3: match por palabras (>= 2 coincidencias, sin empates)
         mejor_score = 0
         mejor_codigo = None
         mejor_nombre = None
+        empatados = []  # nombres de alumnos que comparten el puntaje máximo
         for _, alumno in df_alumnos.iterrows():
             score = coincidencias(nombre_zoom, alumno['Nombre'])
             if score > mejor_score:
                 mejor_score = score
                 mejor_codigo = alumno['Codigo']
                 mejor_nombre = alumno['Nombre']
+                empatados = [alumno['Nombre']]
+            elif score == mejor_score and score > 0:
+                empatados.append(alumno['Nombre'])
 
-        if mejor_score >= 2:
+        if mejor_score >= 2 and len(empatados) == 1:
             resultado[mejor_codigo] = 'A'
             auto_matches.append({
                 'nombre_zoom': nombre_zoom,
                 'alumno': mejor_nombre,
                 'metodo': f'🔤 Palabras ({mejor_score})'
+            })
+        elif mejor_score >= 2 and len(empatados) > 1:
+            pendientes.append({
+                'nombre_zoom': nombre_zoom,
+                'correo': correo,
+                'mejor_sugerencia': None,
+                'mejor_score': mejor_score
             })
         else:
             pendientes.append({
