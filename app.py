@@ -343,7 +343,7 @@ def main():
 
         if archivo_excel:
             excel_bytes = archivo_excel.read()
-            metadata, df_alumnos = leer_excel_asistencia(io.BytesIO(excel_bytes))
+            st.session_state['nombre_archivo_original'] = archivo_excel.name
             if metadata and df_alumnos is not None:
                 st.success(f"✅ {len(df_alumnos)} alumnos cargados")
                 st.markdown(f"**Curso:** {metadata.get('curso', '—')}")
@@ -685,7 +685,7 @@ def main():
                     st.download_button(
                         label="📥 Descargar Excel con asistencias",
                         data=output,
-                        file_name=f"ASISTENCIAS_{nombre_curso}.xlsx",
+                        file_name=st.session_state.get('nombre_archivo_original', f"ASISTENCIAS_{nombre_curso}.xlsx"),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         type="primary"
                     )
