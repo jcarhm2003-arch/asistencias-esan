@@ -306,7 +306,7 @@ def exportar_excel(archivo_original, sesiones, metadata):
         codigo_cell = ws.cell(row=row_idx, column=2)
         if not codigo_cell.value:
             continue
-        codigo = str(codigo_cell.value).strip()
+        codigo = str(int(codigo_cell.value)).strip() if isinstance(codigo_cell.value, (int, float)) else str(codigo_cell.value).strip()
 
         for s_idx, sesion in enumerate(sesiones):
             col = col_inicio_sesiones + s_idx
@@ -452,7 +452,7 @@ def main():
             col_a.metric("✅ Asistieron a tiempo", total_asistio)
             col_b.metric("⏰ Tardanzas", total_tarde)
             col_c.metric("⚠️ Pendientes", len(pendientes))
-            col_d.metric("❌ Faltas", len(df_alumnos) - total_asistio - total_tarde)
+            col_d.metric("❌ Faltas", len(df_alumnos) - total_asistio - total_tarde - len(pendientes))
 
             st.markdown("---")
             st.subheader("👥 Revisión de participantes Zoom")
