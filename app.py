@@ -1,738 +1,556 @@
-import streamlit as st
-import pandas as pd
+"""
+Control de Asistencia Académica - Streamlit App
+=================================================
+Compara listas de alumnos contra registros de asistencia de Zoom,
+clasifica Asistencia / Tardanza / Falta, mantiene un historial acumulativo
+por sesión, permite corrección manual con memoria persistente de
+equivalencias de nombres, y exporta el resultado a Excel.
+"""
+
+import io
 import json
 import re
-import io
-import datetime
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from unidecode import unidecode
+import unicodedata
+from datetime import datetime, date
 
-# ─────────────────────────────────────────────
-# CONFIGURACIÓN
-# ─────────────────────────────────────────────
-st.set_page_config(
-    page_title="Control de Asistencias ESAN",
-    page_icon="📋",
-    layout="wide"
-)
+import pandas as pd
+import pytz
+import streamlit as st
+from rapidfuzz import fuzz, process
 
-HISTORIAL_FILE = "historial_relaciones.json"
+# ---------------------------------------------------------------------------
+# Configuración general de la página
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Control de Asistencia Académica", page_icon="✅", layout="wide")
 
-# ─────────────────────────────────────────────
-# UTILIDADES
-# ─────────────────────────────────────────────
+ZONA_MAP = {
+    "Perú (UTC-5)": "America/Lima",
+    "Estados Unidos (AM/PM)": "America/New_York",
+    "UTC ISO": "UTC",
+}
+LIMA_TZ = pytz.timezone("America/Lima")
 
-def normalizar(texto):
-    """Normaliza texto: sin tildes, sin paréntesis, minúsculas, sin puntos."""
-    if not texto:
+
+# ---------------------------------------------------------------------------
+# FUNCIONES MODULARES
+# ---------------------------------------------------------------------------
+
+def normalizar_nombre(nombre: str) -> str:
+    """Normaliza un nombre: minúsculas, sin tildes, sin espacios repetidos."""
+    if not isinstance(nombre, str):
         return ""
-    texto = str(texto)
-    texto = re.sub(r'\(.*?\)', '', texto)
-    texto = unidecode(texto)
-    texto = texto.lower()
-    texto = re.sub(r'[^a-z\s]', '', texto)
-    return texto.strip()
+    nombre = nombre.strip().lower()
+    nombre = unicodedata.normalize("NFKD", nombre)
+    nombre = "".join(c for c in nombre if not unicodedata.combining(c))
+    nombre = re.sub(r"\s+", " ", nombre).strip()
+    return nombre
 
-def palabras(texto):
-    """Devuelve set de palabras significativas (>= 2 letras)."""
-    return set(w for w in normalizar(texto).split() if len(w) >= 2)
 
-def coincidencias(nombre_zoom, nombre_excel):
-    """Cuenta palabras en común entre nombre Zoom y nombre Excel."""
-    p_zoom = palabras(nombre_zoom)
-    p_excel = palabras(nombre_excel)
-    return len(p_zoom & p_excel)
-
-def extraer_codigo_correo(correo):
-    """Extrae código de alumno de correo tipo 2607391@esan.edu.pe"""
-    if pd.isna(correo) or not str(correo).strip():
+def extraer_codigo(correo: str):
+    """Extrae el código numérico inicial de un correo institucional (ej: 20100729@esan.edu.pe -> 20100729)."""
+    if not isinstance(correo, str) or "@" not in correo:
         return None
-    match = re.match(r'^(\d{6,7})@esan\.edu\.pe$', str(correo).strip())
+    local = correo.split("@")[0].strip()
+    match = re.match(r"^(\d+)", local)
     return match.group(1) if match else None
 
-# ─────────────────────────────────────────────
-# LECTURA DE ARCHIVOS
-# ─────────────────────────────────────────────
 
-def leer_excel_asistencia(archivo):
-    """Lee el Excel maestro y retorna metadata + DataFrame de alumnos."""
-    wb = load_workbook(archivo, read_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
+def convertir_hora(hora_str: str, zona_seleccionada: str, fecha_referencia: date = None):
+    """
+    Convierte un string de hora en formato HH:MM (24h), h:mm AM/PM o ISO UTC
+    a un objeto datetime.time expresado en hora de Perú (America/Lima),
+    que es la base usada para comparar contra los límites configurados.
+    """
+    if not isinstance(hora_str, str) or not hora_str.strip():
+        raise ValueError("hora vacía o inválida")
+    hora_str = hora_str.strip()
+    fecha_referencia = fecha_referencia or datetime.now().date()
 
-    metadata = {}
-    header_row = None
-
-    for i, row in enumerate(rows):
-        if row[0] == 'Promoción':
-            metadata['promocion'] = row[3]
-        elif row[0] == 'Curso':
-            metadata['curso'] = row[3]
-        elif row[0] == 'Profesor(a)':
-            metadata['profesor'] = row[3]
-        elif row[0] == 'No':
-            header_row = i
-            break
-
-    if header_row is None:
-        st.error("No se encontró la fila de encabezados (No, Código, Apellidos y Nombres).")
-        return None, None
-
-    alumnos = []
-    for row in rows[header_row + 1:]:
-        if row[0] is None or not str(row[0]).strip():
-            continue
+    # a) Formato ISO UTC (ej: 2026-06-30T09:27:00Z)
+    if "T" in hora_str and (hora_str.upper().endswith("Z") or "+" in hora_str):
+        iso_str = hora_str.replace("Z", "+00:00").replace("z", "+00:00")
         try:
-            numero = int(row[0])
-        except (ValueError, TypeError):
-            continue
-        codigo = str(row[1]).strip() if row[1] else ""
-        nombre = str(row[2]).strip() if row[2] else ""
-        if nombre:
-            alumnos.append({
-                "No": numero,
-                "Codigo": codigo,
-                "Nombre": nombre
-            })
+            dt = datetime.fromisoformat(iso_str)
+        except ValueError:
+            raise ValueError(f"formato ISO UTC no reconocido: '{hora_str}'")
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        return dt.astimezone(LIMA_TZ).time()
 
-    df = pd.DataFrame(alumnos)
-    wb.close()
-    return metadata, df
-
-def leer_csv_zoom(archivo):
-    """Lee CSV de Zoom y retorna DataFrame con participantes únicos
-    + diccionario de primera hora de entrada por nombre."""
-    try:
-        df_raw = pd.read_csv(archivo, sep=';', encoding='utf-8')
-    except Exception:
-        df_raw = pd.read_csv(archivo, sep=';', encoding='latin-1')
-
-    col_nombre = 'Nombre (nombre original)'
-    col_correo = 'Correo electrónico'
-    col_hora_entrada = 'Hora de entrada'
-
-    if col_nombre not in df_raw.columns:
-        st.error(f"No se encontró la columna '{col_nombre}' en el CSV.")
-        return None, None
-
-    # Calcular primera hora de entrada por nombre (antes de deduplicar)
-    primeras_horas = {}
-    if col_hora_entrada in df_raw.columns:
-        df_horas = df_raw[[col_nombre, col_hora_entrada]].copy()
-        df_horas.columns = ['nombre_zoom', 'hora_entrada']
-        df_horas['nombre_zoom'] = df_horas['nombre_zoom'].astype(str).str.strip()
-        def parsear_hora(val):
+    # b) Formato AM/PM (ej: 9:15 PM)
+    if "am" in hora_str.lower() or "pm" in hora_str.lower():
+        limpio = hora_str.upper().replace(".", "").strip()
+        parsed = None
+        for fmt in ("%I:%M %p", "%I:%M%p", "%I %p"):
             try:
-                dt = pd.to_datetime(val, utc=True)
-                return dt.tz_convert('America/Lima').tz_localize(None)
-            except Exception:
-                pass
-            try:
-                return pd.to_datetime(val, format='%d/%m/%Y %H:%M', errors='coerce')
-            except Exception:
-                return pd.NaT
-
-        df_horas['hora_entrada'] = df_horas['hora_entrada'].apply(parsear_hora)
-        primeras_horas = df_horas.groupby('nombre_zoom')['hora_entrada'].min().to_dict()
-
-    df = df_raw[[col_nombre, col_correo]].copy()
-    df.columns = ['nombre_zoom', 'correo']
-    df['nombre_zoom'] = df['nombre_zoom'].astype(str).str.strip()
-    df['correo'] = df['correo'].astype(str).str.strip().replace('nan', '')
-
-    df = df[df['nombre_zoom'].str.len() > 1]
-    df = df[~df['nombre_zoom'].str.lower().str.contains('sala online|sala esan', na=False)]
-
-    df['tiene_correo'] = df['correo'].str.contains('@esan', na=False)
-    df = df.sort_values('tiene_correo', ascending=False)
-    df = df.drop_duplicates(subset='nombre_zoom', keep='first')
-    df = df.drop(columns='tiene_correo').reset_index(drop=True)
-
-    return df, primeras_horas
-
-# ─────────────────────────────────────────────
-# HISTORIAL
-# ─────────────────────────────────────────────
-
-def cargar_historial():
-    try:
-        with open(HISTORIAL_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def guardar_historial(historial):
-    with open(HISTORIAL_FILE, 'w', encoding='utf-8') as f:
-        json.dump(historial, f, ensure_ascii=False, indent=2)
-
-def clave_historial(nombre_zoom):
-    return normalizar(nombre_zoom)
-
-# ─────────────────────────────────────────────
-# LÓGICA DE CRUCE
-# ─────────────────────────────────────────────
-
-def cruzar_asistencia(df_alumnos, df_zoom, historial, curso_id, primeras_horas=None, hora_limite=None):
-    """
-    resultado: dict {codigo: 'A' | 'T' | 'F'}
-    Si hora_limite está definida (objeto time), compara la primera hora de
-    entrada de cada participante contra ese límite para marcar T (tardanza).
-    """
-    resultado = {row['Codigo']: 'F' for _, row in df_alumnos.iterrows()}
-    pendientes = []
-    auto_matches = []
-
-    historial_curso = historial.get(curso_id, {})
-
-    def calcular_estado(nombre_zoom):
-        """Retorna 'A' o 'T' según la hora de entrada, si aplica."""
-        if not hora_limite or not primeras_horas:
-            return 'A'
-        hora_entrada = primeras_horas.get(nombre_zoom)
-        if hora_entrada is None or pd.isna(hora_entrada):
-            return 'A'
-        if hora_entrada.time() > hora_limite:
-            return 'T'
-        return 'A'
-
-    for _, pax in df_zoom.iterrows():
-        nombre_zoom = pax['nombre_zoom']
-        correo = pax['correo']
-        codigo_correo = extraer_codigo_correo(correo)
-        clave = clave_historial(nombre_zoom)
-        estado = calcular_estado(nombre_zoom)
-
-        # Nivel 1: match por código en correo
-        if codigo_correo and codigo_correo in resultado:
-            resultado[codigo_correo] = estado
-            alumno_nombre = df_alumnos[df_alumnos['Codigo'] == codigo_correo]['Nombre'].values[0]
-            auto_matches.append({
-                'nombre_zoom': nombre_zoom,
-                'alumno': alumno_nombre,
-                'metodo': '📧 Correo' + (' ⏰' if estado == 'T' else '')
-            })
-            continue
-
-        # Nivel 2: historial guardado
-        if clave in historial_curso:
-            codigo_guardado = historial_curso[clave]
-            if codigo_guardado == '__IGNORAR__':
+                parsed = datetime.strptime(limpio, fmt)
+                break
+            except ValueError:
                 continue
-            if codigo_guardado in resultado:
-                resultado[codigo_guardado] = estado
-                alumno_nombre = df_alumnos[df_alumnos['Codigo'] == codigo_guardado]['Nombre'].values[0]
-                auto_matches.append({
-                    'nombre_zoom': nombre_zoom,
-                    'alumno': alumno_nombre,
-                    'metodo': '💾 Historial' + (' ⏰' if estado == 'T' else '')
-                })
+        if parsed is None:
+            raise ValueError(f"formato AM/PM no reconocido: '{hora_str}'")
+        origen_tz = pytz.timezone(ZONA_MAP.get(zona_seleccionada, "America/New_York"))
+        dt_naive = datetime.combine(fecha_referencia, parsed.time())
+        dt_local = origen_tz.localize(dt_naive)
+        return dt_local.astimezone(LIMA_TZ).time()
+
+    # c) Formato HH:MM 24 horas (se asume ya en hora de Perú)
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(hora_str, fmt).time()
+        except ValueError:
             continue
 
-        # Nivel 3: match por palabras (>= 2 coincidencias, sin empates)
-        mejor_score = 0
-        mejor_codigo = None
-        mejor_nombre = None
-        empatados = []
-        for _, alumno in df_alumnos.iterrows():
-            score = coincidencias(nombre_zoom, alumno['Nombre'])
-            if score > mejor_score:
-                mejor_score = score
-                mejor_codigo = alumno['Codigo']
-                mejor_nombre = alumno['Nombre']
-                empatados = [alumno['Nombre']]
-            elif score == mejor_score and score > 0:
-                empatados.append(alumno['Nombre'])
+    raise ValueError(f"formato de hora no reconocido: '{hora_str}'")
 
-        if mejor_score >= 2 and len(empatados) == 1:
-            resultado[mejor_codigo] = estado
-            auto_matches.append({
-                'nombre_zoom': nombre_zoom,
-                'alumno': mejor_nombre,
-                'metodo': f'🔤 Palabras ({mejor_score})' + (' ⏰' if estado == 'T' else '')
-            })
-        elif mejor_score >= 2 and len(empatados) > 1:
-            pendientes.append({
-                'nombre_zoom': nombre_zoom,
-                'correo': correo,
-                'mejor_sugerencia': None,
-                'mejor_score': mejor_score,
-                'estado': estado
+
+def clasificar_asistencia(hora, config: dict) -> str:
+    """Clasifica una hora ya convertida como 'A' (asistencia), 'T' (tardanza) o 'F' (falta)."""
+    if not config.get("control_hora_activo"):
+        return "A"
+
+    hora_asistencia = config.get("hora_limite_asistencia")
+    if hora_asistencia is not None and hora <= hora_asistencia:
+        return "A"
+
+    if config.get("marcar_tardanza_fuera"):
+        hora_tardanza = config.get("hora_limite_tardanza")
+        if hora_tardanza is not None and hora <= hora_tardanza:
+            return "T"
+        return "F"
+
+    return "T"
+
+
+def buscar_coincidencia(nombre_zoom: str, codigo_zoom, alumnos_df: pd.DataFrame, memoria: dict, umbral: int = 80):
+    """
+    Busca el alumno correspondiente a un registro de Zoom.
+    Prioridad: 1) código exacto  2) memoria guardada  3) similaridad de nombre (RapidFuzz).
+    Retorna: (codigo_alumno, nombre_alumno, tipo_coincidencia, score)
+    """
+    nombre_zoom_norm = normalizar_nombre(nombre_zoom)
+
+    # 1. Código exacto
+    if codigo_zoom:
+        coincide = alumnos_df[alumnos_df["Código"].astype(str).str.strip() == str(codigo_zoom).strip()]
+        coincide = coincide[coincide["Código"].astype(str).str.strip() != ""]
+        if not coincide.empty:
+            fila = coincide.iloc[0]
+            return fila["Código"], fila["Alumno"], "CÓDIGO", 100
+
+    # 2. Memoria guardada (equivalencias previas nombre_zoom -> nombre_real)
+    for zoom_key, nombre_real in memoria.items():
+        if normalizar_nombre(zoom_key) == nombre_zoom_norm:
+            coincide = alumnos_df[alumnos_df["Alumno"] == nombre_real]
+            if not coincide.empty:
+                fila = coincide.iloc[0]
+                return fila["Código"], fila["Alumno"], "MEMORIA", 100
+
+    # 3. Similaridad por nombre
+    if not alumnos_df.empty:
+        alumnos_norm = {row["Alumno"]: normalizar_nombre(row["Alumno"]) for _, row in alumnos_df.iterrows()}
+        opciones = list(alumnos_norm.values())
+        if opciones:
+            resultado = process.extractOne(nombre_zoom_norm, opciones, scorer=fuzz.token_sort_ratio)
+            if resultado and resultado[1] >= umbral:
+                nombre_match_norm = resultado[0]
+                for nombre_real, norm in alumnos_norm.items():
+                    if norm == nombre_match_norm:
+                        fila = alumnos_df[alumnos_df["Alumno"] == nombre_real].iloc[0]
+                        return fila["Código"], fila["Alumno"], "SIMILARIDAD", round(resultado[1], 1)
+
+    return None, None, "SIN_COINCIDENCIA", 0
+
+
+def procesar_zoom(texto_zoom: str, alumnos_df: pd.DataFrame, memoria: dict, config: dict, zona_seleccionada: str):
+    """
+    Parsea el texto pegado de Zoom (Nombre<TAB>Correo<TAB>Hora), ignora el encabezado,
+    elimina duplicados (conservando la hora más temprana y contando ingresos),
+    y busca coincidencia contra la tabla de alumnos.
+
+    Retorna: (registros_zoom: dict, errores: list)
+    registros_zoom key -> {nombre, correo, codigo, hora_min, ingresos, codigo_alumno, nombre_alumno, tipo, score}
+    """
+    lineas = [l for l in texto_zoom.strip().split("\n") if l.strip()]
+    if len(lineas) <= 1:
+        raise ValueError("No hay datos de Zoom para procesar (falta encabezado o filas de datos).")
+    lineas = lineas[1:]  # ignorar encabezado
+
+    crudos = {}
+    errores = []
+
+    for i, linea in enumerate(lineas, start=2):
+        partes = linea.split("\t")
+        if len(partes) < 3:
+            errores.append(f"Fila {i}: se esperaban 3 columnas separadas por tabulación (nombre, correo, hora).")
+            continue
+        nombre, correo, hora_str = partes[0].strip(), partes[1].strip(), partes[2].strip()
+        if not nombre:
+            errores.append(f"Fila {i}: nombre vacío, fila ignorada.")
+            continue
+        codigo = extraer_codigo(correo)
+        try:
+            hora = convertir_hora(hora_str, zona_seleccionada)
+        except ValueError as e:
+            errores.append(f"Fila {i} ({nombre}): {e}")
+            continue
+
+        key = (normalizar_nombre(nombre), codigo or "")
+        if key not in crudos:
+            crudos[key] = {"nombre": nombre, "correo": correo, "codigo": codigo, "horas": [hora], "ingresos": 1}
+        else:
+            crudos[key]["horas"].append(hora)
+            crudos[key]["ingresos"] += 1
+
+    registros_zoom = {}
+    for key, datos in crudos.items():
+        hora_min = min(datos["horas"])
+        codigo_al, nombre_al, tipo, score = buscar_coincidencia(datos["nombre"], datos["codigo"], alumnos_df, memoria)
+        registros_zoom[datos["nombre"]] = {
+            "nombre": datos["nombre"],
+            "correo": datos["correo"],
+            "codigo": datos["codigo"],
+            "hora_min": hora_min,
+            "ingresos": datos["ingresos"],
+            "codigo_alumno": codigo_al,
+            "nombre_alumno": nombre_al,
+            "tipo": tipo,
+            "score": score,
+        }
+
+    return registros_zoom, errores
+
+
+def construir_resultados(alumnos_df: pd.DataFrame, registros_zoom: dict, config: dict):
+    """
+    Construye la tabla de resultados con una fila por alumno de la tabla oficial,
+    cruzando contra los registros de Zoom ya matcheados.
+    Retorna: (resultados_df, zoom_no_usados: dict de registros de zoom sin alumno asignado)
+    """
+    usados = set()
+    filas = []
+    for _, alumno in alumnos_df.iterrows():
+        codigo_a, nombre_a = alumno["Código"], alumno["Alumno"]
+        match = None
+        for nombre_zoom, datos in registros_zoom.items():
+            if datos["nombre_alumno"] == nombre_a and nombre_zoom not in usados:
+                match = (nombre_zoom, datos)
+                break
+        if match:
+            nombre_zoom, datos = match
+            usados.add(nombre_zoom)
+            estado = clasificar_asistencia(datos["hora_min"], config)
+            filas.append({
+                "Código": codigo_a,
+                "Alumno": nombre_a,
+                "Nombre_Zoom": nombre_zoom,
+                "Hora": datos["hora_min"].strftime("%H:%M:%S"),
+                "Ingresos": datos["ingresos"],
+                "Tipo_Coincidencia": datos["tipo"],
+                "Confianza": datos["score"],
+                "Estado": estado,
             })
         else:
-            pendientes.append({
-                'nombre_zoom': nombre_zoom,
-                'correo': correo,
-                'mejor_sugerencia': mejor_nombre,
-                'mejor_score': mejor_score,
-                'estado': estado
+            filas.append({
+                "Código": codigo_a,
+                "Alumno": nombre_a,
+                "Nombre_Zoom": None,
+                "Hora": None,
+                "Ingresos": 0,
+                "Tipo_Coincidencia": "SIN_COINCIDENCIA",
+                "Confianza": 0,
+                "Estado": "SIN_COINCIDENCIA",
             })
 
-    return resultado, pendientes, auto_matches
+    zoom_no_usados = {k: v for k, v in registros_zoom.items() if k not in usados}
+    resultados_df = pd.DataFrame(filas)
+    return resultados_df, zoom_no_usados
 
-# ─────────────────────────────────────────────
-# EXPORTAR EXCEL
-# ─────────────────────────────────────────────
 
-def exportar_excel(archivo_original, sesiones, metadata):
-    wb = load_workbook(archivo_original)
-    ws = wb.active
-
-    header_row_idx = None
-    for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-        if row[0] == 'No':
-            header_row_idx = i
-            break
-
-    if not header_row_idx:
-        return None
-
-    col_inicio_sesiones = 7
-
-    verde = PatternFill("solid", fgColor="C6EFCE")
-    rojo = PatternFill("solid", fgColor="FFC7CE")
-    amarillo = PatternFill("solid", fgColor="FFEB9C")
-    azul_header = PatternFill("solid", fgColor="BDD7EE")
-
-    for s_idx, sesion in enumerate(sesiones):
-        col = col_inicio_sesiones + s_idx
-        cell = ws.cell(row=header_row_idx, column=col, value=sesion['label'])
-        cell.fill = azul_header
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal='center')
-
-    for row_idx in range(header_row_idx + 1, ws.max_row + 1):
-        codigo_cell = ws.cell(row=row_idx, column=2)
-        if not codigo_cell.value:
-            continue
-        codigo = str(int(codigo_cell.value)).strip() if isinstance(codigo_cell.value, (int, float)) else str(codigo_cell.value).strip()
-
-        for s_idx, sesion in enumerate(sesiones):
-            col = col_inicio_sesiones + s_idx
-            valor = sesion['resultado'].get(codigo, '—')
-            cell = ws.cell(row=row_idx, column=col, value=valor)
-            cell.alignment = Alignment(horizontal='center')
-            if valor == 'A':
-                cell.fill = verde
-                cell.font = Font(color="276221", bold=True)
-            elif valor == 'T':
-                cell.fill = amarillo
-                cell.font = Font(color="7a5c00", bold=True)
-            elif valor == 'F':
-                cell.fill = rojo
-                cell.font = Font(color="9C0006", bold=True)
-            elif valor == 'P':
-                cell.fill = amarillo
-
+def exportar_excel(historial_df: pd.DataFrame) -> io.BytesIO:
+    """Genera un archivo Excel en memoria a partir del historial acumulado."""
     output = io.BytesIO()
-    wb.save(output)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        historial_df.to_excel(writer, index=False, sheet_name="Asistencia")
     output.seek(0)
     return output
 
-# ─────────────────────────────────────────────
-# INTERFAZ PRINCIPAL
-# ─────────────────────────────────────────────
 
-def main():
-    st.title("📋 Control de Asistencias ESAN")
+# ---------------------------------------------------------------------------
+# INICIALIZACIÓN DE ESTADO
+# ---------------------------------------------------------------------------
 
-    historial = cargar_historial()
+def inicializar_estado():
+    defaults = {
+        "alumnos_df": pd.DataFrame({"Código": pd.Series(dtype="str"), "Alumno": pd.Series(dtype="str")}),
+        "memoria": {},
+        "historial_df": pd.DataFrame({"Código": pd.Series(dtype="str"), "Alumno": pd.Series(dtype="str")}),
+        "sesion_actual": 0,
+        "resultados_df": None,
+        "zoom_no_usados": {},
+        "errores_ultimo_proceso": [],
+        "correccion_abierta": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # ── SIDEBAR ──
-    with st.sidebar:
-        st.header("⚙️ Configuración")
-        st.markdown("---")
 
-        archivo_excel = st.file_uploader(
-            "1️⃣ Sube el Excel maestro de asistencias",
-            type=["xlsx"],
-            key="excel_upload"
-        )
+inicializar_estado()
 
-        if archivo_excel:
-            excel_bytes = archivo_excel.read()
-            metadata, df_alumnos = leer_excel_asistencia(io.BytesIO(excel_bytes))
-            if metadata and df_alumnos is not None:
-                st.success(f"✅ {len(df_alumnos)} alumnos cargados")
-                st.markdown(f"**Curso:** {metadata.get('curso', '—')}")
-                st.markdown(f"**Profesor:** {metadata.get('profesor', '—')}")
 
-                curso_id = metadata.get('curso', 'sin_curso')
-                st.session_state['metadata'] = metadata
-                st.session_state['df_alumnos'] = df_alumnos
-                st.session_state['curso_id'] = curso_id
-                st.session_state['archivo_excel_bytes'] = excel_bytes
-                st.session_state['nombre_archivo_original'] = archivo_excel.name
+# ---------------------------------------------------------------------------
+# SIDEBAR: CONFIGURACIÓN
+# ---------------------------------------------------------------------------
 
-        st.markdown("---")
+with st.sidebar:
+    st.header("⚙️ Configuración")
 
-        if 'sesiones' not in st.session_state:
-            st.session_state['sesiones'] = []
+    control_hora_activo = st.checkbox("Activar control por hora", value=True)
 
-        if 'df_alumnos' in st.session_state:
-            n_sesiones = len(st.session_state['sesiones'])
-            st.markdown(f"**Sesiones procesadas:** {n_sesiones}")
-            for i, s in enumerate(st.session_state['sesiones']):
-                st.markdown(f"- S{i+1}: {s['label']}")
+    hora_limite_asistencia = None
+    hora_limite_tardanza = None
+    marcar_tardanza_fuera = False
 
-            st.markdown("---")
-            if st.button("🗑️ Reiniciar todo", type="secondary"):
-                for key in ['sesiones', 'df_alumnos', 'metadata', 'curso_id',
-                            'archivo_excel_bytes', 'pendientes_actuales',
-                            'resultado_actual', 'auto_matches_actuales', 'label_sesion']:
-                    st.session_state.pop(key, None)
-                st.rerun()
+    if control_hora_activo:
+        hora_limite_asistencia = st.time_input("Hora límite asistencia", value=datetime.strptime("08:15", "%H:%M").time())
+        marcar_tardanza_fuera = st.checkbox("Marcar tardanza fuera de asistencia", value=True)
+        if marcar_tardanza_fuera:
+            hora_limite_tardanza = st.time_input("Hora límite tardanza (después de esto = Falta)", value=datetime.strptime("08:30", "%H:%M").time())
+        st.caption("Sin 'marcar tardanza fuera de asistencia', todo lo posterior a la hora límite se marca como Tardanza (nunca Falta).")
+    else:
+        st.caption("Control por hora desactivado: toda coincidencia válida se marcará como Asistencia (A).")
 
-    # ── ÁREA PRINCIPAL ──
-    if 'df_alumnos' not in st.session_state:
-        st.info("👈 Comienza subiendo el Excel maestro de asistencias en el panel izquierdo.")
-        return
+    st.divider()
+    st.subheader("🌍 Zona horaria")
+    zona_seleccionada = st.selectbox("Formato de hora del reporte Zoom", list(ZONA_MAP.keys()), index=0)
+    st.caption("Perú → HH:MM (24h) · Estados Unidos → h:mm AM/PM · UTC ISO → 2026-06-30T09:27:00Z")
 
-    df_alumnos = st.session_state['df_alumnos']
-    curso_id = st.session_state['curso_id']
-    metadata = st.session_state['metadata']
+    config = {
+        "control_hora_activo": control_hora_activo,
+        "hora_limite_asistencia": hora_limite_asistencia,
+        "marcar_tardanza_fuera": marcar_tardanza_fuera,
+        "hora_limite_tardanza": hora_limite_tardanza,
+    }
 
-    # ── TABS ──
-    tab1, tab2, tab3 = st.tabs(["📥 Procesar sesión", "✅ Resultados", "📤 Exportar"])
+    st.divider()
+    st.subheader("🧠 Memoria de equivalencias")
+    st.caption(f"{len(st.session_state['memoria'])} equivalencias guardadas.")
 
-    # ─── TAB 1: PROCESAR SESIÓN ───
-    with tab1:
-        st.subheader("Cargar CSV de Zoom")
+    memoria_json = json.dumps(st.session_state["memoria"], ensure_ascii=False, indent=2)
+    st.download_button("⬇️ Exportar memoria (JSON)", data=memoria_json, file_name="memoria_asistencia.json", mime="application/json")
 
-        usar_hora_limite = st.checkbox("⏰ ¿Aplicar hora límite de tardanza?", key="check_hora_limite")
-        hora_limite_valor = None
-        if usar_hora_limite:
-            hora_limite_input = st.time_input(
-                "Hora límite (después de esta hora se marca Tardanza)",
-                value=datetime.time(18, 10),
-                key="hora_limite_input"
-            )
-            hora_limite_valor = hora_limite_input
-
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            archivo_csv = st.file_uploader(
-                "Sube el CSV de Zoom para esta sesión",
-                type=["csv"],
-                key="csv_upload"
-            )
-        with col2:
-            label_sesion = st.text_input(
-                "Etiqueta de sesión (ej: 16/06)",
-                value=st.session_state.get('label_sesion', ''),
-                key="label_input"
-            )
-
-        if archivo_csv and label_sesion:
-            df_zoom, primeras_horas = leer_csv_zoom(archivo_csv)
-            if df_zoom is not None:
-                if st.button("🔄 Procesar sesión", type="primary"):
-                    resultado, pendientes, auto_matches = cruzar_asistencia(
-                        df_alumnos, df_zoom, historial, curso_id,
-                        primeras_horas=primeras_horas,
-                        hora_limite=hora_limite_valor
-                    )
-                    st.session_state['pendientes_actuales'] = pendientes
-                    st.session_state['resultado_actual'] = resultado
-                    st.session_state['auto_matches_actuales'] = auto_matches
-                    st.session_state['label_sesion'] = label_sesion
-                    st.rerun()
-
-        # ── REVISIÓN: TODOS LOS PARTICIPANTES ZOOM ──
-        if 'auto_matches_actuales' in st.session_state:
-            auto_matches = st.session_state['auto_matches_actuales']
-            pendientes = st.session_state['pendientes_actuales']
-            resultado = st.session_state['resultado_actual']
-
-            # Métricas
-            col_a, col_b, col_c, col_d = st.columns(4)
-            total_asistio = sum(1 for v in resultado.values() if v == 'A')
-            total_tarde = sum(1 for v in resultado.values() if v == 'T')
-            col_a.metric("✅ Asistieron a tiempo", total_asistio)
-            col_b.metric("⏰ Tardanzas", total_tarde)
-            col_c.metric("⚠️ Pendientes", len(pendientes))
-            col_d.metric("❌ Faltas", len(df_alumnos) - total_asistio - total_tarde - len(pendientes))
-
-            st.markdown("---")
-            st.subheader("👥 Revisión de participantes Zoom")
-            st.caption("Los enlazados automáticamente aparecen con ✅ (no editables). Los pendientes tienen selector con la lista completa de alumnos.")
-
-            # Códigos ya con asistencia confirmada (A o T)
-            codigos_con_a = {cod for cod, val in resultado.items() if val in ('A', 'T')}
-
-            # Lista de opciones para selectbox con estado de cada alumno
-            opciones_alumnos = ["— No enlazar / Ignorar"] + [
-                f"{'✅ ' if row['Codigo'] in codigos_con_a else '❌ F  '}{row['Nombre']} ({row['Codigo']})"
-                for _, row in df_alumnos.iterrows()
-            ]
-
-            relaciones_manuales = {}
-
-            # Reunir todos: primero auto-matches, luego pendientes
-            todos_zoom = []
-            for m in auto_matches:
-                todos_zoom.append({
-                    'nombre_zoom': m['nombre_zoom'],
-                    'correo': '',
-                    'mejor_sugerencia': m['alumno'],
-                    'metodo': m['metodo'],
-                    'es_auto': True
-                })
-            for pax in pendientes:
-                todos_zoom.append({
-                    'nombre_zoom': pax['nombre_zoom'],
-                    'correo': pax['correo'],
-                    'mejor_sugerencia': pax['mejor_sugerencia'],
-                    'metodo': None,
-                    'es_auto': False,
-                    'estado': pax.get('estado', 'A')
-                })
-
-            for i, pax in enumerate(todos_zoom):
-                nombre_zoom = pax['nombre_zoom']
-                es_auto = pax['es_auto']
-
-                with st.container():
-                    col_zoom, col_flecha, col_select = st.columns([3, 0.5, 4])
-
-                    with col_zoom:
-                        if es_auto:
-                            color_borde = "#28a745"
-                            color_bg = "#d4edda"
-                            metodo_badge = f"<small style='color:#155724'>{pax['metodo']}</small>"
-                        else:
-                            color_borde = "#ffc107"
-                            color_bg = "#fff3cd"
-                            correo_display = pax['correo'] if pax['correo'] and pax['correo'] != 'nan' else '—'
-                            metodo_badge = f"<small style='color:#856404'>⚠️ Sin enlazar &nbsp;|&nbsp; Correo: {correo_display}</small>"
-
-                        st.markdown(
-                            f"<div style='background:{color_bg};padding:10px;border-radius:8px;"
-                            f"border-left:4px solid {color_borde};margin:4px 0;color:#1a1a1a'>"
-                            f"<b style='color:#1a1a1a'>Zoom:</b> {nombre_zoom}<br>"
-                            f"{metodo_badge}"
-                            f"</div>",
-                            unsafe_allow_html=True
-                        )
-
-                    with col_flecha:
-                        st.markdown(
-                            "<div style='padding-top:18px;text-align:center;font-size:20px'>→</div>",
-                            unsafe_allow_html=True
-                        )
-
-                    with col_select:
-                        if es_auto:
-                            # No editable — mostrar alumno enlazado
-                            alumno_enlazado = pax['mejor_sugerencia']
-                            st.markdown(
-                                f"<div style='background:#d4edda;padding:10px;border-radius:8px;"
-                                f"border:1px solid #c3e6cb;margin:4px 0;color:#155724;font-weight:bold'>"
-                                f"✅ {alumno_enlazado}"
-                                f"</div>",
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            # Selectbox editable con lista completa de alumnos
-                            idx_default = 0
-                            sugerencia = pax['mejor_sugerencia']
-                            if sugerencia:
-                                for j, op in enumerate(opciones_alumnos):
-                                    if sugerencia in op:
-                                        idx_default = j
-                                        break
-
-                            seleccion = st.selectbox(
-                                f"Alumno para: {nombre_zoom[:30]}",
-                                opciones_alumnos,
-                                index=idx_default,
-                                key=f"select_{i}",
-                                label_visibility="collapsed"
-                            )
-                            relaciones_manuales[nombre_zoom] = seleccion
-
-                    st.markdown("<hr style='margin:4px 0;opacity:0.2'>", unsafe_allow_html=True)
-
-            # ── BOTONES ──
-            st.markdown("---")
-            col_rep, col_ok = st.columns([1, 1])
-
-            with col_rep:
-                if pendientes and st.button("🔄 Reprocesar con estas relaciones", type="secondary"):
-                    estados_pendientes = {p['nombre_zoom']: p.get('estado', 'A') for p in pendientes}
-
-                    for nombre_zoom, seleccion in relaciones_manuales.items():
-                        if seleccion == "— No enlazar / Ignorar":
-                            clave = clave_historial(nombre_zoom)
-                            if curso_id not in historial:
-                                historial[curso_id] = {}
-                            historial[curso_id][clave] = '__IGNORAR__'
-                        else:
-                            match = re.search(r'\((\d+)\)$', seleccion)
-                            if match:
-                                codigo = match.group(1)
-                                resultado[codigo] = estados_pendientes.get(nombre_zoom, 'A')
-                                clave = clave_historial(nombre_zoom)
-                                if curso_id not in historial:
-                                    historial[curso_id] = {}
-                                historial[curso_id][clave] = codigo
-
-                    guardar_historial(historial)
-                    st.session_state['resultado_actual'] = resultado
-                    st.session_state['pendientes_actuales'] = []
-                    st.success("✅ Relaciones aplicadas y guardadas en historial.")
-                    st.rerun()
-
-            with col_ok:
-                if st.button("✅ Confirmar sesión y guardar", type="primary"):
-                    estados_pendientes = {p['nombre_zoom']: p.get('estado', 'A') for p in pendientes}
-
-                    # Guardar relaciones manuales en historial
-                    for nombre_zoom, seleccion in relaciones_manuales.items():
-                        clave = clave_historial(nombre_zoom)
-                        if curso_id not in historial:
-                            historial[curso_id] = {}
-                        if seleccion == "— No enlazar / Ignorar":
-                            historial[curso_id][clave] = '__IGNORAR__'
-                        else:
-                            match = re.search(r'\((\d+)\)$', seleccion)
-                            if match:
-                                codigo = match.group(1)
-                                resultado[codigo] = estados_pendientes.get(nombre_zoom, 'A')
-                                historial[curso_id][clave] = codigo
-
-                    guardar_historial(historial)
-
-                    st.session_state['sesiones'].append({
-                        'label': st.session_state['label_sesion'],
-                        'resultado': resultado
-                    })
-                    st.session_state.pop('pendientes_actuales', None)
-                    st.session_state.pop('resultado_actual', None)
-                    st.session_state.pop('auto_matches_actuales', None)
-                    st.success(f"✅ Sesión '{st.session_state['label_sesion']}' guardada.")
-                    st.rerun()
-
-    # ─── TAB 2: RESULTADOS ───
-    with tab2:
-        sesiones = st.session_state.get('sesiones', [])
-        if not sesiones:
-            st.info("Aún no hay sesiones procesadas.")
-        else:
-            st.subheader("Tabla de asistencia acumulada")
-
-            rows = []
-            for _, alumno in df_alumnos.iterrows():
-                fila = {
-                    'No': alumno['No'],
-                    'Código': alumno['Codigo'],
-                    'Apellidos y Nombres': alumno['Nombre']
-                }
-                total_a = 0
-                for i, s in enumerate(sesiones):
-                    val = s['resultado'].get(alumno['Codigo'], 'F')
-                    fila[f"S{i+1}\n{s['label']}"] = val
-                    if val in ('A', 'T'):
-                        total_a += 1
-                fila['Total asistencias'] = total_a
-                rows.append(fila)
-
-            df_resultado = pd.DataFrame(rows)
-
-            def colorear(val):
-                if val == 'A':
-                    return 'background-color: #C6EFCE; color: #276221; font-weight:bold'
-                elif val == 'T':
-                    return 'background-color: #FFEB9C; color: #7a5c00; font-weight:bold'
-                elif val == 'F':
-                    return 'background-color: #FFC7CE; color: #9C0006; font-weight:bold'
-                return ''
-
-            cols_sesion = [c for c in df_resultado.columns if c.startswith('S')]
-            st.dataframe(
-                df_resultado.style.map(colorear, subset=cols_sesion),
-                use_container_width=True,
-                hide_index=True,
-                height=500
-            )
-
-            st.markdown("---")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total alumnos", len(df_alumnos))
-            col2.metric("Sesiones procesadas", len(sesiones))
-            promedio = sum(
-                sum(1 for s in sesiones if s['resultado'].get(a['Codigo']) in ('A', 'T'))
-                for _, a in df_alumnos.iterrows()
-            ) / max(len(df_alumnos), 1)
-            col3.metric("Promedio de asistencia", f"{promedio:.1f} / {len(sesiones)}")
-
-    # ─── TAB 3: EXPORTAR ───
-    with tab3:
-        sesiones = st.session_state.get('sesiones', [])
-        if not sesiones:
-            st.info("Procesa al menos una sesión antes de exportar.")
-        else:
-            st.subheader("Descargar Excel con asistencias marcadas")
-            st.markdown(
-                "El archivo descargado será el Excel original con columnas **S1, S2, S3...** "
-                "añadidas al lado de los nombres, con colores verde (A), amarillo (T) y rojo (F)."
-            )
-
-            archivo_excel_bytes = st.session_state.get('archivo_excel_bytes')
-            if archivo_excel_bytes:
-                sesiones_export = [
-                    {'label': f"S{i+1}\n{s['label']}", 'resultado': s['resultado']}
-                    for i, s in enumerate(sesiones)
-                ]
-                output = exportar_excel(
-                    io.BytesIO(archivo_excel_bytes),
-                    sesiones_export,
-                    metadata
-                )
-                if output:
-                    nombre_curso = re.sub(r'[^\w]', '_', metadata.get('curso', 'CURSO'))[:30]
-                    st.download_button(
-                        label="📥 Descargar Excel con asistencias",
-                        data=output,
-                        file_name=st.session_state.get('nombre_archivo_original', f"ASISTENCIAS_{nombre_curso}.xlsx"),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary"
-                    )
+    archivo_memoria = st.file_uploader("⬆️ Importar memoria (JSON)", type=["json"], key="uploader_memoria")
+    if archivo_memoria is not None:
+        try:
+            nueva_memoria = json.loads(archivo_memoria.read().decode("utf-8"))
+            if isinstance(nueva_memoria, dict):
+                st.session_state["memoria"].update(nueva_memoria)
+                st.success(f"Memoria importada: {len(nueva_memoria)} equivalencias.")
             else:
-                st.warning("Vuelve a subir el Excel original para poder exportar.")
+                st.error("El JSON debe ser un objeto {nombre_zoom: nombre_real}.")
+        except Exception as e:
+            st.error(f"No se pudo leer el archivo: {e}")
 
-        st.markdown("---")
-        st.subheader("📚 Historial de relaciones guardadas")
-        historial_actual = cargar_historial()
-        if historial_actual:
-            col_hist1, col_hist2 = st.columns([2, 1])
-            with col_hist2:
-                if st.button("🗑️ Limpiar todo el historial", type="secondary"):
-                    guardar_historial({})
-                    st.success("Historial limpiado.")
-                    st.rerun()
+    st.divider()
+    if st.button("🗑️ Nuevo curso / Reiniciar", use_container_width=True):
+        st.session_state["alumnos_df"] = pd.DataFrame({"Código": pd.Series(dtype="str"), "Alumno": pd.Series(dtype="str")})
+        st.session_state["historial_df"] = pd.DataFrame({"Código": pd.Series(dtype="str"), "Alumno": pd.Series(dtype="str")})
+        st.session_state["sesion_actual"] = 0
+        st.session_state["resultados_df"] = None
+        st.session_state["zoom_no_usados"] = {}
+        st.session_state["errores_ultimo_proceso"] = []
+        st.session_state["correccion_abierta"] = None
+        st.success("Curso reiniciado. La memoria de equivalencias se conservó.")
+        st.rerun()
 
-            for curso, relaciones in historial_actual.items():
-                with st.expander(f"Curso: {curso[:60]}"):
-                    col_c1, col_c2 = st.columns([3, 1])
-                    with col_c2:
-                        if st.button(f"🗑️ Limpiar este curso", key=f"del_{curso[:20]}"):
-                            del historial_actual[curso]
-                            guardar_historial(historial_actual)
-                            st.success("Curso eliminado del historial.")
-                            st.rerun()
-                    filas = []
-                    for clave, codigo in relaciones.items():
-                        if codigo == '__IGNORAR__':
-                            filas.append({'Nombre Zoom (normalizado)': clave, 'Alumno asignado': '🚫 Ignorado'})
-                        else:
-                            alumno_match = df_alumnos[df_alumnos['Codigo'] == codigo]
-                            nombre_alumno = alumno_match['Nombre'].values[0] if len(alumno_match) else codigo
-                            filas.append({'Nombre Zoom (normalizado)': clave, 'Alumno asignado': nombre_alumno})
-                    st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# MAIN: TÍTULO
+# ---------------------------------------------------------------------------
+
+st.title("✅ Control de Asistencia Académica")
+st.caption("Compara listas de alumnos contra reportes de Zoom, clasifica A/T/F y mantiene historial por sesión.")
+
+tab_alumnos, tab_zoom, tab_resultados, tab_historial = st.tabs(
+    ["👥 Tabla de alumnos", "📋 Pegado de Zoom", "📊 Resultados", "🗂️ Historial y exportación"]
+)
+
+# ---------------------------------------------------------------------------
+# B. TABLA DE ALUMNOS
+# ---------------------------------------------------------------------------
+with tab_alumnos:
+    st.subheader("Tabla de alumnos")
+    st.caption("Edita manualmente, pega desde Excel (Ctrl+V dentro de la tabla) o agrega filas. El código puede quedar vacío.")
+
+    edited = st.data_editor(
+        st.session_state["alumnos_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Código": st.column_config.TextColumn("Código"),
+            "Alumno": st.column_config.TextColumn("Alumno"),
+        },
+        key="editor_alumnos",
+    )
+    st.session_state["alumnos_df"] = edited.fillna("")
+
+# ---------------------------------------------------------------------------
+# C. PEGADO DE ZOOM
+# ---------------------------------------------------------------------------
+with tab_zoom:
+    st.subheader("Registro de asistencia de Zoom")
+    st.caption("Pega las 3 columnas (Nombre, Correo, Hora) separadas por tabulación, con encabezado en la primera fila.")
+
+    texto_zoom = st.text_area(
+        "Pegar reporte de Zoom",
+        height=280,
+        placeholder="Nombre\tCorreo\tHora\nJuan Huaman\t20100729@esan.edu.pe\t08:03\nMaria Lopez\t20100730@esan.edu.pe\t2026-06-30T09:27:00Z",
+    )
+
+    col_a, col_b = st.columns([1, 3])
+    with col_a:
+        procesar = st.button("▶️ Procesar asistencia", type="primary", use_container_width=True)
+
+    if procesar:
+        alumnos_df = st.session_state["alumnos_df"]
+        alumnos_df = alumnos_df[alumnos_df["Alumno"].astype(str).str.strip() != ""]
+        if alumnos_df.empty:
+            st.error("Primero agrega alumnos en la pestaña 'Tabla de alumnos'.")
+        elif control_hora_activo and hora_limite_asistencia is None:
+            st.error("Configura la hora límite de asistencia en la barra lateral.")
         else:
-            st.info("No hay historial guardado aún.")
+            try:
+                registros_zoom, errores = procesar_zoom(
+                    texto_zoom, alumnos_df, st.session_state["memoria"], config, zona_seleccionada
+                )
+                resultados_df, zoom_no_usados = construir_resultados(alumnos_df, registros_zoom, config)
+                st.session_state["resultados_df"] = resultados_df
+                st.session_state["zoom_no_usados"] = zoom_no_usados
+                st.session_state["errores_ultimo_proceso"] = errores
+                st.success(f"Procesado: {len(resultados_df)} alumnos evaluados, {len(zoom_no_usados)} registros de Zoom sin asignar.")
+            except ValueError as e:
+                st.error(str(e))
 
-if __name__ == "__main__":
-    main()
+    if st.session_state["errores_ultimo_proceso"]:
+        with st.expander(f"⚠️ {len(st.session_state['errores_ultimo_proceso'])} advertencias del último procesamiento"):
+            for err in st.session_state["errores_ultimo_proceso"]:
+                st.write(f"- {err}")
+
+# ---------------------------------------------------------------------------
+# D. RESULTADOS
+# ---------------------------------------------------------------------------
+with tab_resultados:
+    st.subheader("Resultados de la sesión actual")
+
+    resultados_df = st.session_state["resultados_df"]
+
+    if resultados_df is None:
+        st.info("Aún no se ha procesado ninguna sesión. Ve a 'Pegado de Zoom' y presiona 'Procesar asistencia'.")
+    else:
+        badge = {"A": "🟢", "T": "🟡", "F": "🔴", "SIN_COINCIDENCIA": "⚪"}
+        resumen = resultados_df["Estado"].value_counts().to_dict()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🟢 Asistencia", resumen.get("A", 0))
+        c2.metric("🟡 Tardanza", resumen.get("T", 0))
+        c3.metric("🔴 Falta", resumen.get("F", 0))
+        c4.metric("⚪ Sin coincidencia", resumen.get("SIN_COINCIDENCIA", 0))
+
+        st.divider()
+
+        for idx, row in resultados_df.iterrows():
+            cols = st.columns([2.5, 1, 1, 1.2, 1.5, 1.2])
+            cols[0].write(f"**{row['Alumno']}**  \n`{row['Código']}`")
+            cols[1].write(f"{badge.get(row['Estado'], '⚪')} {row['Estado']}")
+            cols[2].write(row["Hora"] or "—")
+            cols[3].write(row["Tipo_Coincidencia"])
+            cols[4].write(row["Nombre_Zoom"] or "—")
+
+            if row["Estado"] == "SIN_COINCIDENCIA":
+                if cols[5].button("Corregir", key=f"btn_corregir_{idx}"):
+                    st.session_state["correccion_abierta"] = idx
+
+            if st.session_state["correccion_abierta"] == idx:
+                opciones = list(st.session_state["zoom_no_usados"].keys())
+                if not opciones:
+                    st.warning("No hay registros de Zoom disponibles para asignar.")
+                else:
+                    seleccion = st.selectbox(
+                        f"Nombre en Zoom que corresponde a **{row['Alumno']}**",
+                        opciones,
+                        key=f"select_corr_{idx}",
+                    )
+                    cg1, cg2 = st.columns([1, 1])
+                    if cg1.button("💾 Guardar equivalencia", key=f"guardar_corr_{idx}"):
+                        st.session_state["memoria"][seleccion] = row["Alumno"]
+                        datos = st.session_state["zoom_no_usados"].pop(seleccion)
+                        estado = clasificar_asistencia(datos["hora_min"], config)
+                        resultados_df.at[idx, "Nombre_Zoom"] = seleccion
+                        resultados_df.at[idx, "Hora"] = datos["hora_min"].strftime("%H:%M:%S")
+                        resultados_df.at[idx, "Ingresos"] = datos["ingresos"]
+                        resultados_df.at[idx, "Tipo_Coincidencia"] = "MANUAL"
+                        resultados_df.at[idx, "Confianza"] = 100
+                        resultados_df.at[idx, "Estado"] = estado
+                        st.session_state["resultados_df"] = resultados_df
+                        st.session_state["correccion_abierta"] = None
+                        st.success(f"'{seleccion}' asignado a {row['Alumno']} y guardado en memoria.")
+                        st.rerun()
+                    if cg2.button("Cancelar", key=f"cancelar_corr_{idx}"):
+                        st.session_state["correccion_abierta"] = None
+                        st.rerun()
+            st.divider()
+
+        st.subheader("💾 Guardar sesión en historial")
+        st.caption("Los alumnos que sigan 'Sin coincidencia' se guardarán como Falta (F).")
+        if st.button("Guardar sesión actual en el historial", type="primary"):
+            st.session_state["sesion_actual"] += 1
+            nueva_col = f"S{st.session_state['sesion_actual']}"
+
+            historial_df = st.session_state["historial_df"].copy()
+            for col_existente in historial_df.columns:
+                if col_existente not in ("Código", "Alumno"):
+                    pass
+
+            valores = {}
+            for _, row in resultados_df.iterrows():
+                estado_final = row["Estado"] if row["Estado"] != "SIN_COINCIDENCIA" else "F"
+                valores[row["Código"] if row["Código"] else row["Alumno"]] = (row["Alumno"], row["Código"], estado_final)
+
+            for llave, (alumno, codigo, estado_final) in valores.items():
+                match_mask = (historial_df["Alumno"] == alumno)
+                if match_mask.any():
+                    historial_df.loc[match_mask, nueva_col] = estado_final
+                else:
+                    nueva_fila = {c: "-" for c in historial_df.columns}
+                    nueva_fila["Código"] = codigo
+                    nueva_fila["Alumno"] = alumno
+                    nueva_fila[nueva_col] = estado_final
+                    historial_df = pd.concat([historial_df, pd.DataFrame([nueva_fila])], ignore_index=True)
+
+            if nueva_col not in historial_df.columns:
+                historial_df[nueva_col] = "-"
+            historial_df[nueva_col] = historial_df[nueva_col].fillna("-")
+
+            st.session_state["historial_df"] = historial_df
+            st.success(f"Sesión {nueva_col} guardada en el historial.")
+            st.rerun()
+
+# ---------------------------------------------------------------------------
+# E. HISTORIAL Y EXPORTACIÓN
+# ---------------------------------------------------------------------------
+with tab_historial:
+    st.subheader("Historial acumulado de asistencia")
+
+    historial_df = st.session_state["historial_df"]
+    if historial_df.empty or len(historial_df.columns) <= 2:
+        st.info("Todavía no hay sesiones guardadas en el historial.")
+    else:
+        st.dataframe(historial_df, use_container_width=True, hide_index=True)
+
+        excel_bytes = exportar_excel(historial_df)
+        st.download_button(
+            "⬇️ Exportar historial a Excel",
+            data=excel_bytes,
+            file_name=f"asistencia_historial_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
